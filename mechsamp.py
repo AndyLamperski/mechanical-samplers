@@ -86,6 +86,11 @@ def splitState(x):
     return q,p
 
 
+class Sampler:
+    def __init__(self):
+        pass
+
+
 class SDESampler:
     def __init__(self,f_fun,g_fun,eta,constraint_fun=None):
         self.f = f_fun
@@ -114,7 +119,13 @@ def torch_to_numpy(f,dt=pt.float32):
 class HybridSampler:
     def __init__(self,f_fun,init_fun,event_fun=None,reset_fun=None):
         vf = torch_to_numpy(f_fun)
-        self.f = lambda t,y : vf(y)
+        def f_wrapped(t,y,*args):
+            x_pt = pt.tensor(y,dtype=pt.float32,requires_grad=True)
+            y_dot_pt = f_fun(x_pt,*args)
+            return y_dot_pt.detach().numpy()
+
+        self.f = f_wrapped
+
         self.init = init_fun
         
         if event_fun is not None:
@@ -131,8 +142,11 @@ class HybridSampler:
             self.reset = None
 
         
-    def step(self,x,tstart=0.,T=1.):
-        x = self.init(x)
+    def step(self,x,tstart=0.,T=1.,*args):
+        x = self.init(x,*args)
+        if isinstance(x,tuple):
+            x,args = x
+        
         x0 = x.detach().numpy()
 
         finished = False
@@ -142,7 +156,7 @@ class HybridSampler:
 
         t_span = [tstart,tstart+T]
         while not finished:
-            sol = itg.solve_ivp(self.f,t_span,x0,events = self.event)
+            sol = itg.solve_ivp(self.f,t_span,x0,events = self.event,args=args)
 
             Time_np_list.append(sol.t)
             X_np_list.append(sol.y)
@@ -162,13 +176,14 @@ class HybridSampler:
         return X,Time
         
 
-def basicHamiltonsEquations(x,loss_fun,*args):
+def basicHamiltonsEquations(x,loss_val,*args):
     q,p = splitState(x)
     x.grad = pt.zeros_like(x)
     
     n = len(q)
-    loss = loss_fun(q,*args)
-    loss.backward()
+    loss_val.backward() 
+    #loss.backward()
+    
     return pt.cat([p,-x.grad[:n]])
 
     
@@ -207,7 +222,8 @@ class SOLangevin(SDESampler):
         def f_fun(x,*args):
             q,p = splitState(x)
             n = len(q)
-            v = basicHamiltonsEquations(x,loss_fun,*args)
+            loss_val = loss_fun(q)
+            v = basicHamiltonsEquations(x,loss_val,*args)
 
             return pt.cat([v[:n],v[n:]-gamma*p])
 
@@ -228,8 +244,10 @@ class SOLangevin(SDESampler):
 
 class HMCSampler(HybridSampler):
     def __init__(self,loss_fun,A=None,b=None,tol=1e-3):
-        def f_fun(x):
-            return basicHamiltonsEquations(x,loss_fun)
+        def f_fun(x,*args):
+            q,p = splitState(x)
+            loss_val = loss_fun(q,*args)
+            return basicHamiltonsEquations(x,loss_val)
 
         if A is None:
             event_fun = None
@@ -661,19 +679,21 @@ class SGSmoothID(SparseSGLangevin):
         
         super().__init__(loss_fun_list,var_dict,eta,dim_list,A_list,b_list)
         
-class SGLangevin:
+class SGLangevin(Sampler):
     def __init__(self,loss_fun_list,eta,A=None,b=None):
         M = len(loss_fun_list)
 
         
-        def f_fun(z,i):
+        def f_fun(z,Batch):
             z.grad = pt.zeros_like(z)
-            f = loss_fun_list[i](z)
+            f = pt.stack([loss_fun_list[i](z) for i in Batch]).sum()
+            
             f.backward()
-            return -M*z.grad
+            return -(M/len(Batch)) * z.grad
+            #return -(M/len(Batch))*z.grad
 
-        def g_fun(z,*args):
-            return np.sqrt(2*M) * pt.eye(len(z))
+        def g_fun(z,Batch):
+            return np.sqrt(2) * pt.eye(len(z))
 
 
         def constrain(x,*args):
@@ -685,37 +705,140 @@ class SGLangevin:
         self.sampler = SDESampler(f_fun,g_fun,eta,constrain)
 
         self.M = M
-    def step(self,x):
-        J = rnd.randint(self.M)
-        x_next = self.sampler.step(x,J)
+    def step(self,x,batch_size=1):
+        Batch = rnd.randint(self.M,size=(batch_size,))
+        x_next = self.sampler.step(x,Batch)
         return x_next.detach().clone().requires_grad_(True)
-        
-class ARLangevin(SGLangevin):
-    def __init__(self,initLL,arLL,order,eta,Y,pad=None,A=None,b=None):
-        if pad is None:
-            pad = order
 
-        
+    
+def ARPreprocess(priorLL,arLL,order,Y,pad=None,
+                 A=None,b=None,thermodynamic=False,NumParam=None):
+    
+    if pad is None:
+        pad = order
+    
+    if thermodynamic:
+        A_t = pt.tensor([[1.],
+                         [-1.]])
+        b_t = pt.tensor([1,0])
+        if A is None:
+            A = pt.cat([pt.zeros((2,NumParam)),A_t],dim=1)
+            b = b_t
+        else:
+            A = pt.block_diag(A,A_t)
+            b = pt.cat([b,b_t])
 
-        initLoss = lambda x : -initLL(x)
 
+    if thermodynamic:
+        def predictionLoss(theta,i):
+            y = Y[i]
+            H = Y[i-order:i]
+            t = theta[-1]
+            thermoLL = t*arLL(y,H,theta[:-1])
+            return -thermoLL
+
+        def priorLoss(theta):
+            return -priorLL(theta[:-1])
+    else:
         def predictionLoss(theta,i):
             y = Y[i]
             H = Y[i-order:i]
             return -arLL(y,H,theta)
-
         
-        predictionLosses = [ft.partial(predictionLoss,i=j) for j in range(pad,len(Y))]
+        priorLoss = lambda x : -priorLL(x)
+            
+    predictionLosses = [ft.partial(predictionLoss,i=j) for j in range(pad,len(Y))]
 
-        loss_list = [initLoss] + predictionLosses
+    loss_list = [priorLoss] + predictionLosses
+
+    return A,b,loss_list
+    
+class ARLangevin(SGLangevin):
+    def __init__(self,priorLL,arLL,order,eta,Y,pad=None,A=None,b=None,
+                 thermodynamic = False,NumParam = None):
+        """
+        NumParam is only needed if running a thermodynamic integration with unconstrained parameters
+        """
+
+        A,b,loss_list = ARPreprocess(priorLL,arLL,order,Y,pad,A,b,thermodynamic,NumParam)
         super().__init__(loss_list,eta,A,b)
 
         self.loss_list = loss_list
 
+    
     def loglikelihood(self,theta):
-        loss = pt.sum(pt.stack([loss(theta) for loss in self.loss_list]))
+        loss = pt.sum(pt.stack([loss(theta) for loss in self.loss_list[1:]]))
         return -loss
         
 
+class SGSOLangevin:
+    def __init__(self,loss_fun_list,eta,gamma=1.,A=None,b=None):
+        M = len(loss_fun_list)
+
+        def f_fun(z,Batch):
+            q,p = splitState(z)
+            n = len(q)
+            loss_val = pt.stack([loss_fun_list[i](q) for i in Batch]).mean()
+            v = basicHamiltonsEquations(z,loss_val)
+
+            return pt.cat([v[:n],M*v[n:]-gamma*p])
+
+        def g_fun(x,*args):
+            n = int(len(x)/2)
+            return pt.cat([pt.zeros((n,n)),
+                           np.sqrt(2)*pt.eye(n)],dim=0)
+
+        def constrain(x,*args):
+            if A is None:
+                return x
+            else:
+                return reflectPolyhedron(x,A,b)
+
+        self.M = M
+
+        self.sampler = SDESampler(f_fun,g_fun,eta,constrain)
         
+    def step(self,x,batch_size=1):
+        Batch = rnd.randint(self.M,size=(batch_size,))
+        x_next = self.sampler.step(x,Batch)
+        return x_next.detach().clone().requires_grad_(True)
         
+
+class ARSGSOLangevin(SGSOLangevin):
+    def __init__(self,priorLL,arLL,order,eta,gamma,Y,pad=None,
+                 A=None,b=None,thermodynamic=False,NumParam=None):
+
+        A,b,loss_list = ARPreprocess(priorLL,arLL,order,Y,pad,A,b,thermodynamic,NumParam)
+
+        super().__init__(loss_list,eta,gamma,A,b)
+
+class ARSOLangevin(SOLangevin):
+    def __init__(self,priorLL,arLL,order,eta,gamma,Y,pad=None,
+                 A=None,b=None,thermodynamic=False,NumParam=None):
+
+        A,b,loss_list = ARPreprocess(priorLL,arLL,order,Y,pad,A,b,thermodynamic,NumParam)
+
+        def loss_fun(q):
+            return pt.stack([loss(q) for loss in loss_list]).sum()
+
+        super().__init__(loss_fun,eta,gamma,A,b)
+        
+class ARHMC(HMCSampler):
+    def __init__(self,priorLL,arLL,order,Y,pad=None,
+                 A=None,b=None,thermodynamic=False,NumParam=None,tol=1e-3):
+
+        A,b,loss_list = ARPreprocess(priorLL,arLL,order,Y,pad,A,b,thermodynamic,NumParam)
+        M = len(loss_list)
+
+        def loss_fun(q,batch):
+            f = pt.stack([loss_list[i](q) for i in batch]).mean()
+            return f
+
+        super().__init__(loss_fun,A,b,tol)
+        def new_init(x,batch_size=1):
+            x_new = super().init(x)
+            Batch = rnd.randint(M,size=(batch_size,))
+            return x_new,(batch,)
+
+        self.init = new_init
+            
